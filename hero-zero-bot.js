@@ -5,66 +5,53 @@ const TelegramBot = require('node-telegram-bot-api');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
-const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 const MASSIVE_API_KEY = process.env.MASSIVE_API_KEY;
 
-const HERO_SYMBOLS = String(process.env.HERO_SYMBOLS || 'SPY,QQQ,TSLA,META,AAPL')
-  .split(',')
-  .map(x => x.trim().toUpperCase())
-  .filter(Boolean);
+const SYMBOL = process.env.SPX_SYMBOL || 'SPX';
 
-const MIN_HERO_SCORE = Number(process.env.MIN_HERO_SCORE || 92);
-const MAX_SPREAD_PCT = Number(process.env.MAX_SPREAD_PCT || 12);
-const MAX_MOVE_FROM_OPEN = Number(process.env.MAX_MOVE_FROM_OPEN || 2.5);
+const MIN_SCORE = Number(process.env.MIN_SCORE || 75);
+const SCAN_INTERVAL_MS = Number(process.env.SCAN_INTERVAL_MS || 15000);
 
-const MIN_VOLUME = Number(process.env.MIN_VOLUME || 500);
-const MIN_OPEN_INTEREST = Number(process.env.MIN_OPEN_INTEREST || 500);
-const MIN_VOLUME_OI_RATIO = Number(process.env.MIN_VOLUME_OI_RATIO || 1.2);
+const MIN_PREMIUM = Number(process.env.MIN_PREMIUM || 1);
+const MAX_PREMIUM = Number(process.env.MAX_PREMIUM || 8);
+const MAX_SPREAD_PCT = Number(process.env.MAX_SPREAD_PCT || 25);
 
-const MIN_PREMIUM = Number(process.env.MIN_PREMIUM || 0.15);
-const MAX_PREMIUM = Number(process.env.MAX_PREMIUM || 1.20);
+const MIN_VOLUME = Number(process.env.MIN_VOLUME || 50);
+const MIN_OPEN_INTEREST = Number(process.env.MIN_OPEN_INTEREST || 50);
+const MIN_VOLUME_OI_RATIO = Number(process.env.MIN_VOLUME_OI_RATIO || 0.20);
 
-const MIN_DELTA = Number(process.env.MIN_DELTA || 0.20);
-const MAX_DELTA = Number(process.env.MAX_DELTA || 0.55);
-const MIN_GAMMA = Number(process.env.MIN_GAMMA || 0.01);
-const MAX_IV = Number(process.env.MAX_IV || 1.80);
+const MIN_DELTA = Number(process.env.MIN_DELTA || 0.10);
+const MAX_DELTA = Number(process.env.MAX_DELTA || 0.60);
+const MIN_GAMMA = Number(process.env.MIN_GAMMA || 0.0001);
+const MAX_IV = Number(process.env.MAX_IV || 5);
 
-const SCAN_INTERVAL_MS = Number(process.env.SCAN_INTERVAL_MS || 60 * 1000);
-const PROFIT_STEP_PREMIUM = Number(process.env.PROFIT_STEP_PREMIUM || 0.10);
+const PROFIT_STEP_PREMIUM = Number(process.env.PROFIT_STEP_PREMIUM || 1);
 const STOP_LOSS_PCT = Number(process.env.STOP_LOSS_PCT || 35);
 
 if (!BOT_TOKEN) throw new Error('Missing BOT_TOKEN');
 if (!ADMIN_CHAT_ID) throw new Error('Missing ADMIN_CHAT_ID');
-if (!FINNHUB_API_KEY) throw new Error('Missing FINNHUB_API_KEY');
 if (!MASSIVE_API_KEY) throw new Error('Missing MASSIVE_API_KEY');
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
-const sentKeys = new Set();
-const activeTrades = new Map();
-const lockedSymbols = new Set();
+let activeTrade = null;
+const sentContracts = new Set();
 
 function todayET() {
-  const now = new Date();
-
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'America/New_York',
     year: 'numeric',
     month: '2-digit',
     day: '2-digit'
-  }).formatToParts(now);
+  }).formatToParts(new Date());
 
-  const y = parts.find(p => p.type === 'year').value;
-  const m = parts.find(p => p.type === 'month').value;
-  const d = parts.find(p => p.type === 'day').value;
-
-  return `${y}-${m}-${d}`;
+  return `${parts.find(p => p.type === 'year').value}-${parts.find(p => p.type === 'month').value}-${parts.find(p => p.type === 'day').value}`;
 }
 
-function n(v, digits = 2) {
+function n(v, d = 2) {
   const x = Number(v);
   if (!Number.isFinite(x)) return 'غير متوفر';
-  return x.toFixed(digits);
+  return x.toFixed(d);
 }
 
 function pct(v) {
@@ -73,20 +60,19 @@ function pct(v) {
   return `${x.toFixed(2)}%`;
 }
 
-function midPrice(bid, ask, fallback) {
+function midPrice(bid, ask, last) {
   const b = Number(bid);
   const a = Number(ask);
-  const f = Number(fallback);
+  const l = Number(last);
 
   if (b > 0 && a > 0) return (b + a) / 2;
   if (a > 0) return a;
   if (b > 0) return b;
-  if (f > 0) return f;
-
+  if (l > 0) return l;
   return null;
 }
 
-function calcSpreadPct(bid, ask) {
+function spreadPct(bid, ask) {
   const b = Number(bid);
   const a = Number(ask);
 
@@ -98,104 +84,10 @@ function calcSpreadPct(bid, ask) {
   return ((a - b) / mid) * 100;
 }
 
-function calcScore({
-  spreadPct,
-  volume,
-  openInterest,
-  volumeOiRatio,
-  premium,
-  moveFromOpenAbs,
-  deltaAbs,
-  gamma,
-  iv
-}) {
-  let score = 0;
-
-  if (spreadPct !== null && spreadPct <= 5) score += 18;
-  else if (spreadPct !== null && spreadPct <= 8) score += 14;
-  else if (spreadPct !== null && spreadPct <= MAX_SPREAD_PCT) score += 8;
-
-  if (volume >= 5000) score += 18;
-  else if (volume >= 2500) score += 14;
-  else if (volume >= MIN_VOLUME) score += 8;
-
-  if (openInterest >= 5000) score += 12;
-  else if (openInterest >= 2500) score += 9;
-  else if (openInterest >= MIN_OPEN_INTEREST) score += 6;
-
-  if (volumeOiRatio >= 5) score += 20;
-  else if (volumeOiRatio >= 3) score += 16;
-  else if (volumeOiRatio >= 2) score += 12;
-  else if (volumeOiRatio >= MIN_VOLUME_OI_RATIO) score += 8;
-
-  if (premium >= 0.25 && premium <= 0.90) score += 10;
-  else if (premium >= MIN_PREMIUM && premium <= MAX_PREMIUM) score += 6;
-
-  if (moveFromOpenAbs <= 1.0) score += 8;
-  else if (moveFromOpenAbs <= MAX_MOVE_FROM_OPEN) score += 4;
-
-  if (deltaAbs >= 0.25 && deltaAbs <= 0.45) score += 8;
-  else if (deltaAbs >= MIN_DELTA && deltaAbs <= MAX_DELTA) score += 5;
-
-  if (gamma >= MIN_GAMMA) score += 4;
-
-  if (iv > 0 && iv <= MAX_IV) score += 2;
-
-  return score;
-}
-
-async function getStockQuote(symbol) {
-
- if (symbol === 'SPX') {
-  return {
-    price: 6000,
-    open: 6000,
-    previousClose: 6000,
-    changePct: 0,
-    moveFromOpen: 0
-  };
-} 
-
-  const { data } = await axios.get('https://finnhub.io/api/v1/quote', {
-    params: {
-      symbol,
-      token: FINNHUB_API_KEY
-    },
-    timeout: 15000
-  });
-
-  const price = Number(data.c);
-  const open = Number(data.o);
-  const previousClose = Number(data.pc);
-
-  if (!(price > 0)) {
-    throw new Error(`لا يوجد سعر من Finnhub للرمز ${symbol}`);
-  }
-
-  const changePct = previousClose > 0 ? ((price - previousClose) / previousClose) * 100 : null;
-  const moveFromOpen = open > 0 ? ((price - open) / open) * 100 : null;
-
-  return {
-    price,
-    open,
-    previousClose,
-    changePct,
-    moveFromOpen
-  };
-}
-
-function allowedDirection(quote, symbol) {
-  if (symbol === 'SPX') return 'CALL';
-
-  if (quote.price > quote.open) return 'CALL';
-  if (quote.price < quote.open) return 'PUT';
-
-  return 'NONE';
-}
-
-async function getOptionChain(symbol) {
+async function getSPXChain() {
   const expiration = todayET();
-  const url = `https://api.massive.com/v3/snapshot/options/${symbol}`;
+
+  const url = `https://api.massive.com/v3/snapshot/options/${SYMBOL}`;
 
   const { data } = await axios.get(url, {
     params: {
@@ -209,138 +101,217 @@ async function getOptionChain(symbol) {
   return Array.isArray(data.results) ? data.results : [];
 }
 
-function normalizeContract(row) {
+function normalize(row) {
   const details = row.details || {};
   const quote = row.last_quote || {};
   const trade = row.last_trade || {};
   const greeks = row.greeks || {};
-
-  const strike = Number(details.strike_price);
-  const side = String(details.contract_type || '').toUpperCase();
-  const ticker = details.ticker || '';
+  const day = row.day || {};
+  const underlying = row.underlying_asset || {};
 
   const bid = Number(quote.bid);
   const ask = Number(quote.ask);
   const last = Number(trade.price);
 
-  const volume = Number(row.day?.volume || 0);
-  const openInterest = Number(row.open_interest || 0);
-
   const premium = midPrice(bid, ask, last);
-  const spreadPct = calcSpreadPct(bid, ask);
-  const volumeOiRatio = openInterest > 0 ? volume / openInterest : 0;
 
-  const delta = Number(greeks.delta || 0);
-  const gamma = Number(greeks.gamma || 0);
-  const iv = Number(row.implied_volatility || 0);
+  const volume = Number(day.volume || 0);
+  const oi = Number(row.open_interest || 0);
+  const volOi = oi > 0 ? volume / oi : 0;
 
   return {
-    ticker,
-    strike,
-    side,
+    ticker: details.ticker || '',
+    strike: Number(details.strike_price),
+    side: String(details.contract_type || '').toUpperCase(),
+    expiration: details.expiration_date || todayET(),
+
     bid,
     ask,
     last,
     premium,
-    spreadPct,
+    spreadPct: spreadPct(bid, ask),
+
     volume,
-    openInterest,
-    volumeOiRatio,
-    delta,
-    gamma,
-    iv
+    openInterest: oi,
+    volumeOiRatio: volOi,
+
+    delta: Number(greeks.delta || 0),
+    gamma: Number(greeks.gamma || 0),
+    theta: Number(greeks.theta || 0),
+    vega: Number(greeks.vega || 0),
+    iv: Number(row.implied_volatility || 0),
+
+    underlyingPrice: Number(underlying.price || 0)
   };
 }
 
-async function getContractByTicker(symbol, ticker) {
-  const direction = allowedDirection(quote, symbol);
-  const contracts = chain.map(normalizeContract);
-  return contracts.find(c => c.ticker === ticker) || null;
+function getUnderlyingPrice(contracts) {
+  for (const c of contracts) {
+    if (c.underlyingPrice > 0) return c.underlyingPrice;
+  }
+
+  return null;
 }
 
-function pickBestContracts(symbol, stockPrice, chain, quote) {
-  const direction = allowedDirection(quote);
-  const moveFromOpenAbs = Math.abs(Number(quote.moveFromOpen || 0));
+function isValidContract(c) {
+  const deltaAbs = Math.abs(c.delta);
 
-  if (direction === 'NONE') return [];
+  return (
+    c.ticker &&
+    Number.isFinite(c.strike) &&
+    c.premium !== null &&
+    c.premium >= MIN_PREMIUM &&
+    c.premium <= MAX_PREMIUM &&
+    c.spreadPct !== null &&
+    c.spreadPct <= MAX_SPREAD_PCT &&
+    c.volume >= MIN_VOLUME &&
+    c.openInterest >= MIN_OPEN_INTEREST &&
+    c.volumeOiRatio >= MIN_VOLUME_OI_RATIO &&
+    deltaAbs >= MIN_DELTA &&
+    deltaAbs <= MAX_DELTA &&
+    c.gamma >= MIN_GAMMA &&
+    (c.iv === 0 || c.iv <= MAX_IV)
+  );
+}
 
-  const normalized = chain
-    .map(normalizeContract)
+function contractScore(c, underlyingPrice) {
+  let score = 0;
+
+  const deltaAbs = Math.abs(c.delta);
+  const distance = Math.abs(c.strike - underlyingPrice);
+
+  if (c.spreadPct <= 5) score += 18;
+  else if (c.spreadPct <= 10) score += 14;
+  else if (c.spreadPct <= MAX_SPREAD_PCT) score += 8;
+
+  if (c.volume >= 5000) score += 18;
+  else if (c.volume >= 1000) score += 14;
+  else if (c.volume >= MIN_VOLUME) score += 8;
+
+  if (c.openInterest >= 5000) score += 12;
+  else if (c.openInterest >= 1000) score += 9;
+  else if (c.openInterest >= MIN_OPEN_INTEREST) score += 6;
+
+  if (c.volumeOiRatio >= 5) score += 20;
+  else if (c.volumeOiRatio >= 3) score += 16;
+  else if (c.volumeOiRatio >= 1) score += 12;
+  else if (c.volumeOiRatio >= MIN_VOLUME_OI_RATIO) score += 8;
+
+  if (deltaAbs >= 0.20 && deltaAbs <= 0.40) score += 10;
+  else if (deltaAbs >= MIN_DELTA && deltaAbs <= MAX_DELTA) score += 6;
+
+  if (c.gamma >= 0.01) score += 10;
+  else if (c.gamma >= 0.001) score += 7;
+  else if (c.gamma >= MIN_GAMMA) score += 4;
+
+  if (c.premium >= 2 && c.premium <= 6) score += 8;
+  else if (c.premium >= MIN_PREMIUM && c.premium <= MAX_PREMIUM) score += 5;
+
+  if (distance <= 10) score += 4;
+  else if (distance <= 25) score += 2;
+
+  return Math.min(score, 100);
+}
+
+function sidePressure(validContracts, side) {
+  const rows = validContracts.filter(c => c.side === side);
+
+  let volume = 0;
+  let dollarFlow = 0;
+  let gammaPower = 0;
+
+  for (const c of rows) {
+    volume += c.volume;
+    dollarFlow += c.volume * c.premium * 100;
+    gammaPower += c.gamma * c.volume;
+  }
+
+  return { volume, dollarFlow, gammaPower };
+}
+
+function chooseDirection(validContracts) {
+  const call = sidePressure(validContracts, 'CALL');
+  const put = sidePressure(validContracts, 'PUT');
+
+  const callPower = call.dollarFlow + call.gammaPower * 100000;
+  const putPower = put.dollarFlow + put.gammaPower * 100000;
+
+  if (callPower > putPower * 1.15) return 'CALL';
+  if (putPower > callPower * 1.15) return 'PUT';
+
+  return 'NONE';
+}
+
+function pickBestSPXContract(chain) {
+  const normalized = chain.map(normalize);
+  const underlyingPrice = getUnderlyingPrice(normalized);
+
+  if (!underlyingPrice) {
+    return { error: 'لم أستطع قراءة سعر SPX من Massive.' };
+  }
+
+  const valid = normalized.filter(isValidContract);
+
+  if (!valid.length) {
+    return {
+      error: 'لا يوجد عقد SPX مناسب بعد الفلاتر.',
+      underlyingPrice,
+      totalContracts: normalized.length,
+      validContracts: 0
+    };
+  }
+
+  const direction = chooseDirection(valid);
+
+  if (direction === 'NONE') {
+    return {
+      error: 'لا يوجد تفوق واضح بين الكول والبوت.',
+      underlyingPrice,
+      totalContracts: normalized.length,
+      validContracts: valid.length
+    };
+  }
+
+  const sideContracts = valid
     .filter(c => {
-      const deltaAbs = Math.abs(Number(c.delta || 0));
-
-      return (
-        c.ticker &&
-        c.side === direction &&
-        Number.isFinite(c.strike) &&
-        c.premium !== null &&
-        c.premium >= MIN_PREMIUM &&
-        c.premium <= MAX_PREMIUM &&
-        c.volume >= MIN_VOLUME &&
-        c.openInterest >= MIN_OPEN_INTEREST &&
-        c.volumeOiRatio >= MIN_VOLUME_OI_RATIO &&
-        c.spreadPct !== null &&
-        c.spreadPct <= MAX_SPREAD_PCT &&
-        deltaAbs >= MIN_DELTA &&
-        deltaAbs <= MAX_DELTA &&
-        c.gamma >= MIN_GAMMA &&
-        (c.iv === 0 || c.iv <= MAX_IV)
-      );
-    });
-
-  let contracts = [];
-
-  if (direction === 'CALL') {
-    contracts = normalized
-      .filter(c => c.strike > stockPrice)
-      .sort((a, b) => a.strike - b.strike);
-  }
-
-  if (direction === 'PUT') {
-    contracts = normalized
-      .filter(c => c.strike < stockPrice)
-      .sort((a, b) => b.strike - a.strike);
-  }
-
-  const candidates = contracts.slice(0, 3).map(c => ({
-    ...c,
-    score: calcScore({
-      spreadPct: c.spreadPct,
-      volume: c.volume,
-      openInterest: c.openInterest,
-      volumeOiRatio: c.volumeOiRatio,
-      premium: c.premium,
-      moveFromOpenAbs,
-      deltaAbs: Math.abs(c.delta),
-      gamma: c.gamma,
-      iv: c.iv
+      if (direction === 'CALL') return c.side === 'CALL' && c.strike >= underlyingPrice;
+      if (direction === 'PUT') return c.side === 'PUT' && c.strike <= underlyingPrice;
+      return false;
     })
-  }));
+    .map(c => ({
+      ...c,
+      score: contractScore(c, underlyingPrice)
+    }))
+    .sort((a, b) => b.score - a.score);
 
-  if (!candidates.length) return [];
+  const best = sideContracts[0];
 
-  return [candidates.sort((a, b) => b.score - a.score)[0]];
+  if (!best) {
+    return {
+      error: 'يوجد اتجاه لكن لا يوجد عقد قريب مناسب.',
+      underlyingPrice,
+      totalContracts: normalized.length,
+      validContracts: valid.length
+    };
+  }
+
+  return {
+    contract: best,
+    underlyingPrice,
+    totalContracts: normalized.length,
+    validContracts: valid.length,
+    direction
+  };
 }
 
-function shortContractName(symbol, c) {
-  return `${symbol} ${c.strike}${c.side === 'CALL' ? 'C' : 'P'}`;
+function contractName(c) {
+  return `SPX ${c.strike}${c.side === 'CALL' ? 'C' : 'P'}`;
 }
 
-function stockStopPrice(quote, c) {
-  const price = Number(quote.price);
-  if (!(price > 0)) return null;
-
-  if (c.side === 'CALL') return price * 0.995;
-  return price * 1.005;
-}
-
-function stockTargets(quote, c) {
-  const price = Number(quote.price);
-  if (!(price > 0)) return { tp1: null, tp2: null, tp3: null };
-
+function stockTargets(price, side) {
   const step = price * 0.0025;
 
-  if (c.side === 'CALL') {
+  if (side === 'CALL') {
     return {
       tp1: price + step,
       tp2: price + step * 2,
@@ -355,46 +326,44 @@ function stockTargets(quote, c) {
   };
 }
 
-function buildAlert(symbol, quote, c) {
-  const sideEmoji = c.side === 'CALL' ? '🟢' : '🔴';
+function buildEntryMessage(c, underlyingPrice) {
   const sideArabic = c.side === 'CALL' ? 'كول' : 'بوت';
+  const sideEmoji = c.side === 'CALL' ? '🟢' : '🔴';
 
   const stopContract = c.premium * (1 - STOP_LOSS_PCT / 100);
-  const stopStock = stockStopPrice(quote, c);
-  const t = stockTargets(quote, c);
+  const targets = stockTargets(underlyingPrice, c.side);
 
   return `
-🚀 صفقة هيرو زيرو
+🚀 صفقة SPX خاصة
 
-📊 السهم: ${symbol}
+📊 الأصل: SPX
 ${sideEmoji} النوع: ${sideArabic}
 📅 الانتهاء: ${todayET()}
 
 🎯 العقد:
-${shortContractName(symbol, c)}
+${contractName(c)}
 ${c.ticker}
 
-💰 سعر السهم الحالي: ${n(quote.price)}
-📍 مستوى الدخول: ${n(quote.price)}
+💰 سعر SPX الحالي: ${n(underlyingPrice)}
+📍 مستوى الدخول: ${n(underlyingPrice)}
 
 💵 دخول العقد: ${n(c.premium)}
 🛑 وقف العقد: ${n(stopContract)}
-🛑 وقف السهم: ${n(stopStock)}
 📌 نوع الوقف: وقف تلقائي محسوب
 
-🎯 أهداف السهم:
-TP1: ${n(t.tp1)}
-TP2: ${n(t.tp2)}
-TP3: ${n(t.tp3)}
+🎯 أهداف SPX:
+TP1: ${n(targets.tp1)}
+TP2: ${n(targets.tp2)}
+TP3: ${n(targets.tp3)}
 
 📦 OI: ${Math.round(c.openInterest).toLocaleString()}
 📊 Volume: ${Math.round(c.volume).toLocaleString()}
 
-🔥 درجة الهيرو: ${c.score}/100
+🔥 درجة الصفقة: ${c.score}/100
 📏 السبريد: ${pct(c.spreadPct)}
 ⚡ Vol/OI: ${n(c.volumeOiRatio, 2)}x
 🧬 Delta: ${n(c.delta, 3)}
-⚡ Gamma: ${n(c.gamma, 4)}
+⚡ Gamma: ${n(c.gamma, 5)}
 🌡️ IV: ${n(c.iv, 2)}
 
 🔔 سيتم إرسال تحديث كلما ارتفع العقد +${n(PROFIT_STEP_PREMIUM)}
@@ -403,255 +372,173 @@ TP3: ${n(t.tp3)}
 `.trim();
 }
 
-function addActiveTrade(symbol, quote, c) {
-  const key = `${todayET()}_${symbol}_${c.ticker}`;
-
-  activeTrades.set(key, {
-    key,
-    symbol,
-    ticker: c.ticker,
-    side: c.side,
-    strike: c.strike,
-    contractName: shortContractName(symbol, c),
-    entryPremium: c.premium,
-    lastPremium: c.premium,
-    highestPremium: c.premium,
-    stopPremium: c.premium * (1 - STOP_LOSS_PCT / 100),
-    nextPremiumAlert: c.premium + PROFIT_STEP_PREMIUM,
-    targets: {
-      tp1: c.premium * 1.5,
-      tp2: c.premium * 2.0,
-      tp3: c.premium * 3.0
-    },
-    tp1Hit: false,
-    tp2Hit: false,
-    tp3Hit: false,
-    isClosed: false,
-    createdAt: new Date().toISOString()
-  });
-}
-
-function targetStatus(currentPremium, targetPremium) {
-  return currentPremium >= targetPremium ? '✅ تحقق' : '⏳ لم يتحقق';
-}
-
-function buildUpdateMessage(trade, current) {
-  const profitPremium = current.premium - trade.entryPremium;
+function buildUpdateMessage(current) {
+  const profit = current.premium - activeTrade.entryPremium;
 
   return `
-📈 تحديث العقد — هيرو زيرو
+📈 تحديث عقد SPX
 
-📊 السهم: ${trade.symbol}
 🎯 العقد:
-${trade.contractName}
-${trade.ticker}
+${activeTrade.name}
+${activeTrade.ticker}
 
-💵 دخول العقد: ${n(trade.entryPremium)}
+💵 دخول العقد: ${n(activeTrade.entryPremium)}
 💵 السعر الحالي: ${n(current.premium)}
-✅ الربح الحالي: +${n(profitPremium)}
+✅ الربح الحالي: +${n(profit)}
 
 🎯 حالة الأهداف:
-TP1: ${targetStatus(current.premium, trade.targets.tp1)}
-TP2: ${targetStatus(current.premium, trade.targets.tp2)}
-TP3: ${targetStatus(current.premium, trade.targets.tp3)}
+TP1: ${current.premium >= activeTrade.tp1 ? '✅ تحقق' : '⏳ لم يتحقق'}
+TP2: ${current.premium >= activeTrade.tp2 ? '✅ تحقق' : '⏳ لم يتحقق'}
+TP3: ${current.premium >= activeTrade.tp3 ? '✅ تحقق' : '⏳ لم يتحقق'}
 
-🛑 وقف العقد: ${n(trade.stopPremium)}
+🛑 وقف العقد: ${n(activeTrade.stopPremium)}
 📦 OI: ${Math.round(current.openInterest).toLocaleString()}
 📊 Volume: ${Math.round(current.volume).toLocaleString()}
 `.trim();
 }
 
-function buildStopMessage(trade, current) {
-  const result = current.premium - trade.entryPremium;
+function buildStopMessage(current) {
+  const result = current.premium - activeTrade.entryPremium;
 
   return `
-🛑 ضرب وقف الخسارة — هيرو زيرو
+🛑 ضرب وقف SPX
 
-📊 السهم: ${trade.symbol}
 🎯 العقد:
-${trade.contractName}
-${trade.ticker}
+${activeTrade.name}
+${activeTrade.ticker}
 
-💵 دخول العقد: ${n(trade.entryPremium)}
+💵 الدخول: ${n(activeTrade.entryPremium)}
 💵 السعر الحالي: ${n(current.premium)}
 📉 النتيجة: ${n(result)}
 
-⚠️ تم إغلاق متابعة الصفقة.
+تم إغلاق متابعة الصفقة.
 `.trim();
 }
 
-function buildTp3Message(trade, current) {
-  const profitPremium = current.premium - trade.entryPremium;
+function buildTp3Message(current) {
+  const profit = current.premium - activeTrade.entryPremium;
 
   return `
-🏆 تحقق الهدف الثالث — هيرو زيرو
+🏆 تحقق الهدف الثالث — SPX
 
-📊 السهم: ${trade.symbol}
 🎯 العقد:
-${trade.contractName}
-${trade.ticker}
+${activeTrade.name}
+${activeTrade.ticker}
 
-💵 دخول العقد: ${n(trade.entryPremium)}
+💵 الدخول: ${n(activeTrade.entryPremium)}
 💵 السعر الحالي: ${n(current.premium)}
-✅ الربح الحالي: +${n(profitPremium)}
+✅ الربح الحالي: +${n(profit)}
 
 🔥 الصفقة حققت كامل أهدافها.
-ارفع وقفك إذا بتستمر، وانتبه لعقدك.
 `.trim();
 }
 
-async function scanSymbol(symbol) {
+function openTrade(c) {
+  activeTrade = {
+    ticker: c.ticker,
+    side: c.side,
+    strike: c.strike,
+    name: contractName(c),
+    entryPremium: c.premium,
+    stopPremium: c.premium * (1 - STOP_LOSS_PCT / 100),
+    nextAlert: c.premium + PROFIT_STEP_PREMIUM,
+    tp1: c.premium * 1.5,
+    tp2: c.premium * 2,
+    tp3: c.premium * 3,
+    openedAt: new Date().toISOString()
+  };
+}
+
+async function getCurrentContract(ticker) {
+  const chain = await getSPXChain();
+  const contracts = chain.map(normalize);
+  return contracts.find(c => c.ticker === ticker) || null;
+}
+
+async function monitorTrade() {
+  if (!activeTrade) return;
+
+  const current = await getCurrentContract(activeTrade.ticker);
+
+  if (!current || current.premium === null) {
+    console.log('لا يمكن تحديث العقد الحالي');
+    return;
+  }
+
+  while (current.premium >= activeTrade.nextAlert) {
+    await bot.sendMessage(ADMIN_CHAT_ID, buildUpdateMessage(current));
+    activeTrade.nextAlert += PROFIT_STEP_PREMIUM;
+  }
+
+  if (current.premium >= activeTrade.tp3) {
+    await bot.sendMessage(ADMIN_CHAT_ID, buildTp3Message(current));
+    activeTrade = null;
+    return;
+  }
+
+  if (current.premium <= activeTrade.stopPremium) {
+    await bot.sendMessage(ADMIN_CHAT_ID, buildStopMessage(current));
+    activeTrade = null;
+  }
+}
+
+async function scanSPX() {
   try {
-    if (lockedSymbols.has(symbol)) {
-      console.log(`${symbol}: مقفل بسبب وجود صفقة نشطة`);
+    if (activeTrade) {
+      await monitorTrade();
       return;
     }
 
-    const quote = await getStockQuote(symbol);
-    const moveAbs = Math.abs(Number(quote.moveFromOpen || 0));
+    const chain = await getSPXChain();
+    const picked = pickBestSPXContract(chain);
 
-    if (moveAbs > MAX_MOVE_FROM_OPEN) {
-      console.log(`${symbol}: تم التجاهل بسبب الحركة من الافتتاح ${moveAbs.toFixed(2)}%`);
+    if (picked.error) {
+      console.log('SPX:', picked.error);
+      console.log({
+        underlyingPrice: picked.underlyingPrice,
+        totalContracts: picked.totalContracts,
+        validContracts: picked.validContracts
+      });
       return;
     }
 
-    const chain = await getOptionChain(symbol);
+    const c = picked.contract;
 
-    if (!chain.length) {
-      console.log(`${symbol}: لا توجد عقود متاحة اليوم`);
+    if (sentContracts.has(c.ticker)) {
+      console.log('تم تجاهل عقد مرسل سابقاً:', c.ticker);
       return;
     }
 
-    const candidates = pickBestContracts(symbol, quote.price, chain, quote);
+    console.log(`SPX ${c.side} ${c.ticker} score ${c.score}`);
 
-    if (!candidates.length) {
-      console.log(`${symbol}: لا يوجد عقد هيرو مناسب مع فلتر الاتجاه`);
-      return;
-    }
-
-    for (const c of candidates) {
-      const key = `${todayET()}_${symbol}_${c.ticker}`;
-
-      if (sentKeys.has(key)) continue;
-
-      console.log(`${symbol} ${c.side} ${c.ticker} score ${c.score}`);
-
-      if (c.score >= MIN_HERO_SCORE) {
-        await bot.sendMessage(ADMIN_CHAT_ID, buildAlert(symbol, quote, c));
-
-        sentKeys.add(key);
-        lockedSymbols.add(symbol);
-        addActiveTrade(symbol, quote, c);
-      }
+    if (c.score >= MIN_SCORE) {
+      await bot.sendMessage(ADMIN_CHAT_ID, buildEntryMessage(c, picked.underlyingPrice));
+      sentContracts.add(c.ticker);
+      openTrade(c);
     }
   } catch (err) {
-    console.error(`${symbol} ERROR:`, err.response?.data || err.message);
+    console.error('SPX ERROR:', err.response?.data || err.message);
   }
-}
-
-async function monitorActiveTrades() {
-  if (!activeTrades.size) return;
-
-  for (const [key, trade] of activeTrades.entries()) {
-    if (trade.isClosed) continue;
-
-    try {
-      const current = await getContractByTicker(trade.symbol, trade.ticker);
-
-      if (!current || current.premium === null) {
-        console.log(`${trade.symbol}: لا يمكن تحديث العقد ${trade.ticker}`);
-        continue;
-      }
-
-      trade.lastPremium = current.premium;
-      trade.highestPremium = Math.max(trade.highestPremium, current.premium);
-
-      while (current.premium >= trade.nextPremiumAlert) {
-        await bot.sendMessage(ADMIN_CHAT_ID, buildUpdateMessage(trade, current));
-        trade.nextPremiumAlert += PROFIT_STEP_PREMIUM;
-      }
-
-      if (!trade.tp1Hit && current.premium >= trade.targets.tp1) {
-        trade.tp1Hit = true;
-      }
-
-      if (!trade.tp2Hit && current.premium >= trade.targets.tp2) {
-        trade.tp2Hit = true;
-      }
-
-      if (!trade.tp3Hit && current.premium >= trade.targets.tp3) {
-        trade.tp3Hit = true;
-        trade.isClosed = true;
-
-        await bot.sendMessage(ADMIN_CHAT_ID, buildTp3Message(trade, current));
-
-        lockedSymbols.delete(trade.symbol);
-        activeTrades.delete(key);
-        continue;
-      }
-
-      if (current.premium <= trade.stopPremium) {
-        trade.isClosed = true;
-
-        await bot.sendMessage(ADMIN_CHAT_ID, buildStopMessage(trade, current));
-
-        lockedSymbols.delete(trade.symbol);
-        activeTrades.delete(key);
-      }
-    } catch (err) {
-      console.error(`MONITOR ERROR ${trade.symbol}:`, err.response?.data || err.message);
-    }
-  }
-}
-
-async function scanAll() {
-  console.log(`بدء الفحص: ${HERO_SYMBOLS.join(', ')}`);
-
-  for (const symbol of HERO_SYMBOLS) {
-    await scanSymbol(symbol);
-    await new Promise(resolve => setTimeout(resolve, 1000));
-  }
-
-  await monitorActiveTrades();
-
-  console.log(`الفحص القادم بعد ${Math.round(SCAN_INTERVAL_MS / 1000)} ثانية`);
 }
 
 async function start() {
-  console.log('HERO ZERO BOT STARTED');
+  console.log('SPX BOT STARTED');
 
   await bot.sendMessage(
     ADMIN_CHAT_ID,
-    `🚀 تم تشغيل بوت الهيرو زيرو
+    `🚀 تم تشغيل بوت SPX الخاص
 
-📊 الرموز:
-${HERO_SYMBOLS.join(', ')}
+📊 الرمز: SPX
+🔥 أقل درجة: ${MIN_SCORE}
+📏 أعلى سبريد: ${MAX_SPREAD_PCT}%
+💵 نطاق العقد: ${MIN_PREMIUM} إلى ${MAX_PREMIUM}
+🔔 التحديث: كل +${n(PROFIT_STEP_PREMIUM)}
 
-🔥 أقل درجة للإرسال:
-${MIN_HERO_SCORE}
-
-📏 أعلى سبريد:
-${MAX_SPREAD_PCT}%
-
-📍 أعلى حركة من الافتتاح:
-${MAX_MOVE_FROM_OPEN}%
-
-🔔 تحديث العقد:
-كل +${n(PROFIT_STEP_PREMIUM)}
-
-✅ قفل الرمز:
-لن يعطي صفقة ثانية على نفس السهم حتى تنتهي الصفقة الحالية.
-
-✅ فلتر الاتجاه:
-CALL فقط إذا السعر فوق الافتتاح
-PUT فقط إذا السعر تحت الافتتاح
-
-✅ فلتر Greeks:
-Delta / Gamma / IV مفعلة.`
+✅ البوت يختار عقد واحد فقط حسب قوة الكول أو البوت.`
   );
 
-  await scanAll();
-  setInterval(scanAll, SCAN_INTERVAL_MS);
+  await scanSPX();
+  setInterval(scanSPX, SCAN_INTERVAL_MS);
 }
 
 start().catch(err => {
