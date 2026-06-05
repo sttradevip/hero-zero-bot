@@ -253,7 +253,7 @@ function normalizeContract(row) {
 }
 
 async function getContractByTicker(symbol, ticker) {
-  const chain = await getOptionChain(symbol);
+  const direction = allowedDirection(quote, symbol);
   const contracts = chain.map(normalizeContract);
   return contracts.find(c => c.ticker === ticker) || null;
 }
