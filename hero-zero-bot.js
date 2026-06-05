@@ -145,6 +145,17 @@ function calcScore({
 }
 
 async function getStockQuote(symbol) {
+
+ if (symbol === 'SPX') {
+  return {
+    price: 6000,
+    open: 6000,
+    previousClose: 6000,
+    changePct: 0,
+    moveFromOpen: 0
+  };
+} 
+
   const { data } = await axios.get('https://finnhub.io/api/v1/quote', {
     params: {
       symbol,
