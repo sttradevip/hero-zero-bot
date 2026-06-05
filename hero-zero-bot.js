@@ -92,19 +92,25 @@ async function massiveGet(path, params = {}) {
 // ===============================
 async function getSpxPrice() {
   try {
-    const data = await massiveGet('/v2/aggs/ticker/I:SPX/prev');
-    const r = data?.results?.[0];
-    if (!r) return null;
+    const data = await massiveGet('/v3/snapshot/indices/I:SPX');
+    const r = data?.results;
+
+    const price =
+      Number(r?.value) ||
+      Number(r?.session?.close) ||
+      Number(r?.session?.previous_close);
+
+    if (!price) return null;
 
     return {
-      price: Number(r.c),
-      open: Number(r.o),
-      high: Number(r.h),
-      low: Number(r.l),
-      close: Number(r.c)
+      price,
+      open: Number(r?.session?.open || price),
+      high: Number(r?.session?.high || price),
+      low: Number(r?.session?.low || price),
+      close: price
     };
   } catch (e) {
-    console.log('SPX PRICE ERROR:', e.message);
+    console.log('SPX PRICE ERROR:', e.response?.status, e.message);
     return null;
   }
 }
