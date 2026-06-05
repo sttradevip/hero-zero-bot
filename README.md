@@ -1,1 +1,0 @@
-# hero-zero-bot
