@@ -24,6 +24,11 @@ const MIN_VOLUME_OI_RATIO = Number(process.env.MIN_VOLUME_OI_RATIO || 1.2);
 const MIN_PREMIUM = Number(process.env.MIN_PREMIUM || 0.15);
 const MAX_PREMIUM = Number(process.env.MAX_PREMIUM || 1.20);
 
+const MIN_DELTA = Number(process.env.MIN_DELTA || 0.20);
+const MAX_DELTA = Number(process.env.MAX_DELTA || 0.55);
+const MIN_GAMMA = Number(process.env.MIN_GAMMA || 0.01);
+const MAX_IV = Number(process.env.MAX_IV || 1.80);
+
 const SCAN_INTERVAL_MS = Number(process.env.SCAN_INTERVAL_MS || 60 * 1000);
 const PROFIT_STEP_PREMIUM = Number(process.env.PROFIT_STEP_PREMIUM || 0.10);
 const STOP_LOSS_PCT = Number(process.env.STOP_LOSS_PCT || 35);
@@ -47,11 +52,7 @@ function todayET() {
     day: '2-digit'
   }).formatToParts(now);
 
-  const y = parts.find(p => p.type === 'year').value;
-  const m = parts.find(p => p.type === 'month').value;
-  const d = parts.find(p => p.type === 'day').value;
-
-  return `${y}-${m}-${d}`;
+  return `${parts.find(p => p.type === 'year').value}-${parts.find(p => p.type === 'month').value}-${parts.find(p => p.type === 'day').value}`;
 }
 
 function n(v, digits = 2) {
@@ -82,7 +83,6 @@ function midPrice(bid, ask, fallback) {
 function calcSpreadPct(bid, ask) {
   const b = Number(bid);
   const a = Number(ask);
-
   if (!(b > 0) || !(a > 0)) return null;
 
   const mid = (a + b) / 2;
@@ -91,41 +91,45 @@ function calcSpreadPct(bid, ask) {
   return ((a - b) / mid) * 100;
 }
 
-function calcScore({ spreadPct, volume, openInterest, volumeOiRatio, premium, moveFromOpenAbs }) {
+function calcScore({ spreadPct, volume, openInterest, volumeOiRatio, premium, moveFromOpenAbs, deltaAbs, gamma, iv }) {
   let score = 0;
 
-  if (spreadPct !== null && spreadPct <= 5) score += 20;
-  else if (spreadPct !== null && spreadPct <= 8) score += 16;
-  else if (spreadPct !== null && spreadPct <= MAX_SPREAD_PCT) score += 10;
+  if (spreadPct !== null && spreadPct <= 5) score += 18;
+  else if (spreadPct !== null && spreadPct <= 8) score += 14;
+  else if (spreadPct !== null && spreadPct <= MAX_SPREAD_PCT) score += 8;
 
-  if (volume >= 5000) score += 20;
-  else if (volume >= 2500) score += 16;
-  else if (volume >= MIN_VOLUME) score += 10;
+  if (volume >= 5000) score += 18;
+  else if (volume >= 2500) score += 14;
+  else if (volume >= MIN_VOLUME) score += 8;
 
-  if (openInterest >= 5000) score += 15;
-  else if (openInterest >= 2500) score += 12;
-  else if (openInterest >= MIN_OPEN_INTEREST) score += 8;
+  if (openInterest >= 5000) score += 12;
+  else if (openInterest >= 2500) score += 9;
+  else if (openInterest >= MIN_OPEN_INTEREST) score += 6;
 
-  if (volumeOiRatio >= 5) score += 25;
-  else if (volumeOiRatio >= 3) score += 20;
-  else if (volumeOiRatio >= 2) score += 15;
-  else if (volumeOiRatio >= MIN_VOLUME_OI_RATIO) score += 10;
+  if (volumeOiRatio >= 5) score += 20;
+  else if (volumeOiRatio >= 3) score += 16;
+  else if (volumeOiRatio >= 2) score += 12;
+  else if (volumeOiRatio >= MIN_VOLUME_OI_RATIO) score += 8;
 
   if (premium >= 0.25 && premium <= 0.90) score += 10;
   else if (premium >= MIN_PREMIUM && premium <= MAX_PREMIUM) score += 6;
 
-  if (moveFromOpenAbs <= 1.0) score += 10;
-  else if (moveFromOpenAbs <= MAX_MOVE_FROM_OPEN) score += 5;
+  if (moveFromOpenAbs <= 1.0) score += 8;
+  else if (moveFromOpenAbs <= MAX_MOVE_FROM_OPEN) score += 4;
+
+  if (deltaAbs >= 0.25 && deltaAbs <= 0.45) score += 8;
+  else if (deltaAbs >= MIN_DELTA && deltaAbs <= MAX_DELTA) score += 5;
+
+  if (gamma >= MIN_GAMMA) score += 4;
+
+  if (iv > 0 && iv <= MAX_IV) score += 2;
 
   return score;
 }
 
 async function getStockQuote(symbol) {
   const { data } = await axios.get('https://finnhub.io/api/v1/quote', {
-    params: {
-      symbol,
-      token: FINNHUB_API_KEY
-    },
+    params: { symbol, token: FINNHUB_API_KEY },
     timeout: 15000
   });
 
@@ -139,6 +143,12 @@ async function getStockQuote(symbol) {
   const moveFromOpen = open > 0 ? ((price - open) / open) * 100 : null;
 
   return { price, open, previousClose, changePct, moveFromOpen };
+}
+
+function allowedDirection(quote) {
+  if (quote.price > quote.open) return 'CALL';
+  if (quote.price < quote.open) return 'PUT';
+  return 'NONE';
 }
 
 async function getOptionChain(symbol) {
@@ -178,6 +188,10 @@ function normalizeContract(row) {
   const spreadPct = calcSpreadPct(bid, ask);
   const volumeOiRatio = openInterest > 0 ? volume / openInterest : 0;
 
+  const delta = Number(greeks.delta || 0);
+  const gamma = Number(greeks.gamma || 0);
+  const iv = Number(row.implied_volatility || 0);
+
   return {
     ticker,
     strike,
@@ -190,8 +204,9 @@ function normalizeContract(row) {
     volume,
     openInterest,
     volumeOiRatio,
-    delta: greeks.delta,
-    gamma: greeks.gamma
+    delta,
+    gamma,
+    iv
   };
 }
 
@@ -201,35 +216,49 @@ async function getContractByTicker(symbol, ticker) {
   return contracts.find(c => c.ticker === ticker) || null;
 }
 
-function pickBestContracts(symbol, stockPrice, chain, moveFromOpenAbs) {
+function pickBestContracts(symbol, stockPrice, chain, quote) {
+  const direction = allowedDirection(quote);
+  const moveFromOpenAbs = Math.abs(Number(quote.moveFromOpen || 0));
+
+  if (direction === 'NONE') return [];
+
   const normalized = chain
     .map(normalizeContract)
-    .filter(c =>
-      c.ticker &&
-      Number.isFinite(c.strike) &&
-      c.premium !== null &&
-      c.premium >= MIN_PREMIUM &&
-      c.premium <= MAX_PREMIUM &&
-      c.volume >= MIN_VOLUME &&
-      c.openInterest >= MIN_OPEN_INTEREST &&
-      c.volumeOiRatio >= MIN_VOLUME_OI_RATIO &&
-      c.spreadPct !== null &&
-      c.spreadPct <= MAX_SPREAD_PCT
-    );
+    .filter(c => {
+      const deltaAbs = Math.abs(Number(c.delta || 0));
 
-  const bestCall = normalized
-    .filter(c => c.side === 'CALL' && c.strike > stockPrice)
-    .sort((a, b) => a.strike - b.strike)[0];
+      return (
+        c.ticker &&
+        c.side === direction &&
+        Number.isFinite(c.strike) &&
+        c.premium !== null &&
+        c.premium >= MIN_PREMIUM &&
+        c.premium <= MAX_PREMIUM &&
+        c.volume >= MIN_VOLUME &&
+        c.openInterest >= MIN_OPEN_INTEREST &&
+        c.volumeOiRatio >= MIN_VOLUME_OI_RATIO &&
+        c.spreadPct !== null &&
+        c.spreadPct <= MAX_SPREAD_PCT &&
+        deltaAbs >= MIN_DELTA &&
+        deltaAbs <= MAX_DELTA &&
+        c.gamma >= MIN_GAMMA &&
+        (c.iv === 0 || c.iv <= MAX_IV)
+      );
+    });
 
-  const bestPut = normalized
-    .filter(c => c.side === 'PUT' && c.strike < stockPrice)
-    .sort((a, b) => b.strike - a.strike)[0];
+  let contracts;
 
-  const candidates = [];
-  if (bestCall) candidates.push(bestCall);
-  if (bestPut) candidates.push(bestPut);
+  if (direction === 'CALL') {
+    contracts = normalized
+      .filter(c => c.strike > stockPrice)
+      .sort((a, b) => a.strike - b.strike);
+  } else {
+    contracts = normalized
+      .filter(c => c.strike < stockPrice)
+      .sort((a, b) => b.strike - a.strike);
+  }
 
-  const scored = candidates.map(c => ({
+  const candidates = contracts.slice(0, 3).map(c => ({
     ...c,
     score: calcScore({
       spreadPct: c.spreadPct,
@@ -237,13 +266,16 @@ function pickBestContracts(symbol, stockPrice, chain, moveFromOpenAbs) {
       openInterest: c.openInterest,
       volumeOiRatio: c.volumeOiRatio,
       premium: c.premium,
-      moveFromOpenAbs
+      moveFromOpenAbs,
+      deltaAbs: Math.abs(c.delta),
+      gamma: c.gamma,
+      iv: c.iv
     })
   }));
 
-  if (!scored.length) return [];
+  if (!candidates.length) return [];
 
-  return [scored.sort((a, b) => b.score - a.score)[0]];
+  return [candidates.sort((a, b) => b.score - a.score)[0]];
 }
 
 function shortContractName(symbol, c) {
@@ -265,18 +297,10 @@ function stockTargets(quote, c) {
   const step = price * 0.0025;
 
   if (c.side === 'CALL') {
-    return {
-      tp1: price + step,
-      tp2: price + step * 2,
-      tp3: price + step * 3
-    };
+    return { tp1: price + step, tp2: price + step * 2, tp3: price + step * 3 };
   }
 
-  return {
-    tp1: price - step,
-    tp2: price - step * 2,
-    tp3: price - step * 3
-  };
+  return { tp1: price - step, tp2: price - step * 2, tp3: price - step * 3 };
 }
 
 function buildAlert(symbol, quote, c) {
@@ -317,6 +341,9 @@ TP3: ${n(t.tp3)}
 🔥 درجة الهيرو: ${c.score}/100
 📏 السبريد: ${pct(c.spreadPct)}
 ⚡ Vol/OI: ${n(c.volumeOiRatio, 2)}x
+🧬 Delta: ${n(c.delta, 3)}
+⚡ Gamma: ${n(c.gamma, 4)}
+🌡️ IV: ${n(c.iv, 2)}
 
 🔔 سيتم إرسال تحديث كلما ارتفع العقد +${n(PROFIT_STEP_PREMIUM)}
 
@@ -350,8 +377,7 @@ function addActiveTrade(symbol, quote, c) {
 }
 
 function targetStatus(currentPremium, targetPremium) {
-  if (currentPremium >= targetPremium) return '✅ تحقق';
-  return '⏳ لم يتحقق';
+  return currentPremium >= targetPremium ? '✅ تحقق' : '⏳ لم يتحقق';
 }
 
 function buildUpdateMessage(trade, current) {
@@ -416,10 +442,10 @@ async function scanSymbol(symbol) {
       return;
     }
 
-    const candidates = pickBestContracts(symbol, quote.price, chain, moveAbs);
+    const candidates = pickBestContracts(symbol, quote.price, chain, quote);
 
     if (!candidates.length) {
-      console.log(`${symbol}: لا يوجد عقد هيرو مناسب`);
+      console.log(`${symbol}: لا يوجد عقد هيرو مناسب مع فلتر الاتجاه`);
       return;
     }
 
@@ -510,8 +536,12 @@ ${MAX_MOVE_FROM_OPEN}%
 🔔 تحديث العقد:
 كل +${n(PROFIT_STEP_PREMIUM)}
 
-✅ الاختيار:
-أفضل عقد واحد فقط لكل سهم، كول أو بوت حسب الشروط والمعطيات.`
+✅ فلتر الاتجاه:
+CALL فقط إذا السعر فوق الافتتاح
+PUT فقط إذا السعر تحت الافتتاح
+
+✅ فلتر Greeks:
+Delta / Gamma / IV مفعلة.`
   );
 
   await scanAll();
