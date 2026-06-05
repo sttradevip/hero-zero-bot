@@ -319,6 +319,22 @@ function pickBestContracts(symbol, stockPrice, chain, quote) {
   return [candidates.sort((a, b) => b.score - a.score)[0]];
 }
 
+console.log(
+  'SPX CANDIDATES:',
+  candidates.map(x => ({
+    strike: x.strike,
+    side: x.side,
+    score: x.score,
+    premium: x.premium,
+    delta: x.delta,
+    gamma: x.gamma,
+    iv: x.iv,
+    volume: x.volume,
+    oi: x.openInterest,
+    spread: x.spreadPct
+  }))
+);
+
 function shortContractName(symbol, c) {
   return `${symbol} ${c.strike}${c.side === 'CALL' ? 'C' : 'P'}`;
 }
