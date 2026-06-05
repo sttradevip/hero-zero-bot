@@ -42,9 +42,11 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
 const sentKeys = new Set();
 const activeTrades = new Map();
+const lockedSymbols = new Set();
 
 function todayET() {
   const now = new Date();
+
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'America/New_York',
     year: 'numeric',
@@ -52,7 +54,11 @@ function todayET() {
     day: '2-digit'
   }).formatToParts(now);
 
-  return `${parts.find(p => p.type === 'year').value}-${parts.find(p => p.type === 'month').value}-${parts.find(p => p.type === 'day').value}`;
+  const y = parts.find(p => p.type === 'year').value;
+  const m = parts.find(p => p.type === 'month').value;
+  const d = parts.find(p => p.type === 'day').value;
+
+  return `${y}-${m}-${d}`;
 }
 
 function n(v, digits = 2) {
@@ -83,6 +89,7 @@ function midPrice(bid, ask, fallback) {
 function calcSpreadPct(bid, ask) {
   const b = Number(bid);
   const a = Number(ask);
+
   if (!(b > 0) || !(a > 0)) return null;
 
   const mid = (a + b) / 2;
@@ -91,7 +98,17 @@ function calcSpreadPct(bid, ask) {
   return ((a - b) / mid) * 100;
 }
 
-function calcScore({ spreadPct, volume, openInterest, volumeOiRatio, premium, moveFromOpenAbs, deltaAbs, gamma, iv }) {
+function calcScore({
+  spreadPct,
+  volume,
+  openInterest,
+  volumeOiRatio,
+  premium,
+  moveFromOpenAbs,
+  deltaAbs,
+  gamma,
+  iv
+}) {
   let score = 0;
 
   if (spreadPct !== null && spreadPct <= 5) score += 18;
@@ -129,7 +146,10 @@ function calcScore({ spreadPct, volume, openInterest, volumeOiRatio, premium, mo
 
 async function getStockQuote(symbol) {
   const { data } = await axios.get('https://finnhub.io/api/v1/quote', {
-    params: { symbol, token: FINNHUB_API_KEY },
+    params: {
+      symbol,
+      token: FINNHUB_API_KEY
+    },
     timeout: 15000
   });
 
@@ -137,12 +157,20 @@ async function getStockQuote(symbol) {
   const open = Number(data.o);
   const previousClose = Number(data.pc);
 
-  if (!(price > 0)) throw new Error(`لا يوجد سعر من Finnhub للرمز ${symbol}`);
+  if (!(price > 0)) {
+    throw new Error(`لا يوجد سعر من Finnhub للرمز ${symbol}`);
+  }
 
   const changePct = previousClose > 0 ? ((price - previousClose) / previousClose) * 100 : null;
   const moveFromOpen = open > 0 ? ((price - open) / open) * 100 : null;
 
-  return { price, open, previousClose, changePct, moveFromOpen };
+  return {
+    price,
+    open,
+    previousClose,
+    changePct,
+    moveFromOpen
+  };
 }
 
 function allowedDirection(quote) {
@@ -246,13 +274,15 @@ function pickBestContracts(symbol, stockPrice, chain, quote) {
       );
     });
 
-  let contracts;
+  let contracts = [];
 
   if (direction === 'CALL') {
     contracts = normalized
       .filter(c => c.strike > stockPrice)
       .sort((a, b) => a.strike - b.strike);
-  } else {
+  }
+
+  if (direction === 'PUT') {
     contracts = normalized
       .filter(c => c.strike < stockPrice)
       .sort((a, b) => b.strike - a.strike);
@@ -297,10 +327,18 @@ function stockTargets(quote, c) {
   const step = price * 0.0025;
 
   if (c.side === 'CALL') {
-    return { tp1: price + step, tp2: price + step * 2, tp3: price + step * 3 };
+    return {
+      tp1: price + step,
+      tp2: price + step * 2,
+      tp3: price + step * 3
+    };
   }
 
-  return { tp1: price - step, tp2: price - step * 2, tp3: price - step * 3 };
+  return {
+    tp1: price - step,
+    tp2: price - step * 2,
+    tp3: price - step * 3
+  };
 }
 
 function buildAlert(symbol, quote, c) {
@@ -371,6 +409,9 @@ function addActiveTrade(symbol, quote, c) {
       tp2: c.premium * 2.0,
       tp3: c.premium * 3.0
     },
+    tp1Hit: false,
+    tp2Hit: false,
+    tp3Hit: false,
     isClosed: false,
     createdAt: new Date().toISOString()
   });
@@ -425,8 +466,33 @@ ${trade.ticker}
 `.trim();
 }
 
+function buildTp3Message(trade, current) {
+  const profitPremium = current.premium - trade.entryPremium;
+
+  return `
+🏆 تحقق الهدف الثالث — هيرو زيرو
+
+📊 السهم: ${trade.symbol}
+🎯 العقد:
+${trade.contractName}
+${trade.ticker}
+
+💵 دخول العقد: ${n(trade.entryPremium)}
+💵 السعر الحالي: ${n(current.premium)}
+✅ الربح الحالي: +${n(profitPremium)}
+
+🔥 الصفقة حققت كامل أهدافها.
+ارفع وقفك إذا بتستمر، وانتبه لعقدك.
+`.trim();
+}
+
 async function scanSymbol(symbol) {
   try {
+    if (lockedSymbols.has(symbol)) {
+      console.log(`${symbol}: مقفل بسبب وجود صفقة نشطة`);
+      return;
+    }
+
     const quote = await getStockQuote(symbol);
     const moveAbs = Math.abs(Number(quote.moveFromOpen || 0));
 
@@ -460,6 +526,7 @@ async function scanSymbol(symbol) {
         await bot.sendMessage(ADMIN_CHAT_ID, buildAlert(symbol, quote, c));
 
         sentKeys.add(key);
+        lockedSymbols.add(symbol);
         addActiveTrade(symbol, quote, c);
       }
     }
@@ -490,9 +557,31 @@ async function monitorActiveTrades() {
         trade.nextPremiumAlert += PROFIT_STEP_PREMIUM;
       }
 
+      if (!trade.tp1Hit && current.premium >= trade.targets.tp1) {
+        trade.tp1Hit = true;
+      }
+
+      if (!trade.tp2Hit && current.premium >= trade.targets.tp2) {
+        trade.tp2Hit = true;
+      }
+
+      if (!trade.tp3Hit && current.premium >= trade.targets.tp3) {
+        trade.tp3Hit = true;
+        trade.isClosed = true;
+
+        await bot.sendMessage(ADMIN_CHAT_ID, buildTp3Message(trade, current));
+
+        lockedSymbols.delete(trade.symbol);
+        activeTrades.delete(key);
+        continue;
+      }
+
       if (current.premium <= trade.stopPremium) {
         trade.isClosed = true;
+
         await bot.sendMessage(ADMIN_CHAT_ID, buildStopMessage(trade, current));
+
+        lockedSymbols.delete(trade.symbol);
         activeTrades.delete(key);
       }
     } catch (err) {
@@ -535,6 +624,9 @@ ${MAX_MOVE_FROM_OPEN}%
 
 🔔 تحديث العقد:
 كل +${n(PROFIT_STEP_PREMIUM)}
+
+✅ قفل الرمز:
+لن يعطي صفقة ثانية على نفس السهم حتى تنتهي الصفقة الحالية.
 
 ✅ فلتر الاتجاه:
 CALL فقط إذا السعر فوق الافتتاح
