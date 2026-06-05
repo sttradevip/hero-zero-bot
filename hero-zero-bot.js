@@ -147,10 +147,21 @@ function normalize(row) {
 
 function getUnderlyingPrice(contracts) {
   for (const c of contracts) {
-    if (c.underlyingPrice > 0) return c.underlyingPrice;
+    if (c.underlyingPrice > 0) {
+      return c.underlyingPrice;
+    }
   }
 
-  return null;
+  const strikes = contracts
+    .map(c => Number(c.strike))
+    .filter(x => Number.isFinite(x) && x > 0)
+    .sort((a, b) => a - b);
+
+  if (!strikes.length) {
+    return null;
+  }
+
+  return strikes[Math.floor(strikes.length / 2)];
 }
 
 function isValidContract(c) {
