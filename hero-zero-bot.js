@@ -504,4 +504,18 @@ bot.on('message', msg => {
 console.log('SPX ONLY BOT STARTED');
 
 setInterval(scan, SCAN_INTERVAL_MS);
+
+(async () => {
+  try {
+    const test = await massiveGet('/v3/reference/options/contracts', {
+      underlying_ticker: 'SPX',
+      limit: 5
+    });
+
+    console.log('SPX CONTRACT TEST:', JSON.stringify(test).slice(0, 500));
+  } catch (e) {
+    console.log('SPX CONTRACT TEST ERROR:', e.response?.status, e.message);
+  }
+})();
+
 scan();
