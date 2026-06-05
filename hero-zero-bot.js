@@ -184,9 +184,12 @@ async function getStockQuote(symbol) {
   };
 }
 
-function allowedDirection(quote) {
+function allowedDirection(quote, symbol) {
+  if (symbol === 'SPX') return 'CALL';
+
   if (quote.price > quote.open) return 'CALL';
   if (quote.price < quote.open) return 'PUT';
+
   return 'NONE';
 }
 
